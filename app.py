@@ -5,6 +5,7 @@ import os
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -13,6 +14,7 @@ from youtube_mp3 import download_mp3, validate_youtube_url
 
 
 APP_TITLE = "YouTube → MP3（更新版）"
+MAX_DOWNLOAD_RETRIES = 3
 SETTINGS_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "YouTubeMp3" / "settings.json"
 BG = "#f5f3ef"
 CARD = "#ffffff"
@@ -280,20 +282,29 @@ class YouTubeMp3App(tk.Tk):
         succeeded = 0
         for index, url in enumerate(urls, start=1):
             self.events.put(("item", (index, len(urls), url)))
-            try:
-                download_mp3(
-                    url,
-                    output,
-                    quality,
-                    playlist,
-                    progress_callback=lambda data: self.events.put(("progress", data)),
-                    log_callback=lambda message: self.events.put(("log", message)),
-                )
-            except Exception as exc:
-                errors.append((index, url, str(exc)))
-                self.events.put(("log", f"{index}/{len(urls)}件目で失敗: {exc}"))
-            else:
-                succeeded += 1
+            for attempt in range(MAX_DOWNLOAD_RETRIES + 1):
+                try:
+                    download_mp3(
+                        url,
+                        output,
+                        quality,
+                        playlist,
+                        progress_callback=lambda data: self.events.put(("progress", data)),
+                        log_callback=lambda message: self.events.put(("log", message)),
+                    )
+                except Exception as exc:
+                    if attempt < MAX_DOWNLOAD_RETRIES:
+                        retry_number = attempt + 1
+                        wait_seconds = retry_number
+                        self.events.put(("retry", (index, len(urls), retry_number, wait_seconds)))
+                        self.events.put(("log", f"{index}/{len(urls)}件目に失敗。{wait_seconds}秒後に再試行します（{retry_number}/{MAX_DOWNLOAD_RETRIES}回目）"))
+                        time.sleep(wait_seconds)
+                        continue
+                    errors.append((index, url, str(exc)))
+                    self.events.put(("log", f"{index}/{len(urls)}件目は{MAX_DOWNLOAD_RETRIES}回再試行後も失敗: {exc}"))
+                else:
+                    succeeded += 1
+                    break
         self.events.put(("done", {"output": output, "total": len(urls), "succeeded": succeeded, "errors": errors}))
 
     def _drain_events(self) -> None:
@@ -306,6 +317,10 @@ class YouTubeMp3App(tk.Tk):
                     index, total, _url = payload  # type: ignore[misc]
                     self.percent_var.set(0)
                     self.status_var.set(f"{index}/{total}件目を処理中…")
+                elif kind == "retry":
+                    index, total, retry_number, wait_seconds = payload  # type: ignore[misc]
+                    self.percent_var.set(0)
+                    self.status_var.set(f"{index}/{total}件目: {retry_number}/{MAX_DOWNLOAD_RETRIES}回目の再試行まで{wait_seconds}秒待機")
                 elif kind == "progress":
                     self._update_progress(payload)  # type: ignore[arg-type]
                 elif kind == "error":
